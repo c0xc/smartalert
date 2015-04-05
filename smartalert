@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+
+# http://storagemojo.com/2007/02/19/googles-disk-failure-experience/
+
+# smartmontools binary
+[[ -z "$SMARTCTL" ]] && SMARTCTL="/usr/sbin/smartctl"
+if [[ ! -x "$SMARTCTL" ]]; then
+    echo "Error: smartctl not found!" >&2
+    exit -1
+fi
+
+# SMART attributes checked for non-zero values
+declare -a check_nonzero
+check_nonzero+=('5')   # Reallocated_Sector_Ct
+check_nonzero+=('10')  # Spin_Retry_Count
+check_nonzero+=('183') # Runtime_Bad_Block
+check_nonzero+=('188') # Command_Timeout
+check_nonzero+=('196') # Reallocated_Event_Count
+check_nonzero+=('197') # Current_Pending_Sector
+check_nonzero+=('198') # Offline_Uncorrectable
+check_nonzero+=('199') # UDMA_CRC_Error_Count
+
+# SMART attributes are first collected, then evaluated
+declare -a drivelist
+declare -A drivesmart_attributes
+
+# Helper functions
+
+function debug()
+{
+    if [[ $_V -eq 1 ]]; then
+        echo -e "$@"
+    fi
+}
+
+function info()
+{
+    if [[ $_Q -eq 0 ]]; then
+        echo -e "$@"
+    fi
+}
+
+function warn()
+{
+    echo -e "$@" >&2
+}
+
+function grep_record()
+{
+    local id="$1"
+    local smart="$2"
+    echo "$smart" | sed 's/^[ \t]*//' | grep -e "^$id[^0-9]"
+}
+
+# Check options
+
+_V=0
+_Q=0
+_L=0
+
+while getopts ":vql" opt; do
+    case $opt in
+        v)  _V=1
+            ;;
+        q)  _Q=1
+            ;;
+        l)  _L=1
+            ;;
+    esac
+done
+
+# List input files (text files or drives)
+# Each argument can be a text file containing smart data or a block file
+
+# Arguments
+for arg; do
+    [[ $(echo "$arg" | grep -e '^-') ]] && continue
+    drivelist+=("$arg")
+done
+
+# No Arguments -> all drives
+if [ ${#drivelist[@]} = 0 ]; then
+    for i in $($SMARTCTL --scan -d sat | cut -f1 -d' '); do
+        drivelist+=("$i")
+    done
+fi
+
+# List drives to be checked
+if [[ $_L -eq 1 ]]; then
+    printf -- '%s\n' "${drivelist[@]}";
+    exit 0
+fi
+debug \
+"$(
+    echo -n "Checking SMART files: ";
+    printf -- '(%s) ' "${drivelist[@]}";
+    echo -e "\n \n"
+)"
+
+# Error count
+attribute_error_count=0
+fatal_error_count=0
+
+# Get smart data
+# Get smart attributes from text file or read actual smart data
+# Text file input sucks because it doesn't check everything (errors)
+for file in "${drivelist[@]}"; do
+
+    # Ignore empty string
+    if [[ "$file" == "" ]]; then
+        continue
+    fi
+
+    # Text input
+    # Special case -> continue if valid text input found
+    if [[ -f "$file" ]]; then
+        # Got text file input
+        smart_attributes=$(cat "$file")
+        valid=false
+        if echo "$smart_attributes" | \
+        grep '=== START OF READ SMART DATA SECTION ===' \
+        >/dev/null 2>&1; then
+            valid=true
+        fi
+
+        if [[ ! $valid == true ]]; then
+            warn "Invalid input from file: $file"
+        else
+            drivesmart_attributes["$file"]="$smart_attributes"
+        fi
+        continue
+    fi
+    # Done with text file input, continue with block files
+
+    # Expand short name
+    actualfile="$file"
+    if [[ ! -e "$file" ]]; then
+        # sda -> /dev/sda
+        [[ -b "/dev/$file" ]] && actualfile="/dev/$file"
+        # ata-... -> /dev/disk/by-id/ata-...
+        [[ -b "/dev/disk/by-id/$file" ]] && \
+            actualfile="/dev/disk/by-id/$file"
+        # pci-... -> /dev/disk/by-path/pci-...
+        [[ -b "/dev/disk/by-path/$file" ]] && \
+            actualfile="/dev/disk/by-path/$file"
+    fi
+
+    # Skip if block device not found
+    if [[ ! -b "$actualfile" ]]; then
+        # Print $file in warning, $actualfile might be empty
+        warn "Invalid argument, cannot find: $file ($actualfile)"
+        continue
+    fi
+    # Continue with existing block file
+
+    # Device type
+    # Try auto first, then sat
+    type=
+    smart_attributes=
+    for t in "auto" "sat" "usb"; do
+        smart_attributes=$($SMARTCTL -A -d $t "$actualfile")
+        smart_attributes_code=$?
+        smart_attributes_body=$(echo "$smart_attributes" | \
+            sed '/smartctl/,/^\s*$/{d}')
+        if [[ $smart_attributes_code -eq 0 ]]; then
+            # Success, use that type, keep output
+            type=$t
+            break
+        elif [[ $smart_attributes_code -eq 1 ]]; then
+            # Error code 1, probably wrong type, try next one
+            # Clear output
+            smart_attributes=
+            continue
+        else
+            # Other error, warn but keep output and continue
+            warn "Got error $smart_attributes_code"\
+                "reading smart data: $file ($actualfile)"
+            warn "$smart_attributes_body\n"
+            continue 2
+        fi
+    done
+
+    # Check if reading data failed
+    if [[ $smart_attributes_code -ne 0 || "$smart_attributes" == "" ]]; then
+        warn "Unable to read smart data: $file ($actualfile)"
+        if [[ "$smart_attributes_body" != "" ]]; then
+            warn "$smart_attributes_body"
+        fi
+        continue
+    fi
+
+    # Double-check output
+    valid=false
+    if echo "$smart_attributes" | \
+    grep '=== START OF READ SMART DATA SECTION ===' \
+    >/dev/null 2>&1; then
+        valid=true
+    fi
+    if [[ ! $valid == true ]]; then
+        warn "Got invalid output: $file ($actualfile)"
+        warn "$smart_attributes"
+        continue
+    fi
+    # Attributes table output valid
+
+    # Put smart attributes table in hash
+    drivesmart_attributes["$file"]="$smart_attributes"
+
+    # Check for smart errors
+    if ! smart_error=$($SMARTCTL -l error -d $t "$actualfile"); then
+        ((fatal_error_count++))
+        warn "FATAL: SMART ERROR ON: $actualfile"
+        warn "$smart_error\n"
+    fi
+
+done
+
+# Check attributes for errors
+for k in "${!drivesmart_attributes[@]}"; do
+    file="$k"
+    smart="${drivesmart_attributes[$k]}"
+
+    debug "Device: $file:"
+    debug "$(echo "$smart" | sed 's/^/> /')"
+
+    unset errors
+    declare -a errors
+
+    checked_attributes_count=0
+    for id in "${check_nonzero[@]}"; do
+        record=$(grep_record "$id" "$smart")
+        if [[ -z "$record" ]]; then
+            debug "Cannot find SMART id #$id for $file"
+            continue
+        fi
+        ((checked_attributes_count++))
+        name=$(echo "$record" | awk '{ print $2 }')
+        raw=$(echo "$record" | awk '{ print $10 }')
+        if [[ $raw -ne 0 ]]; then
+            errors+=("$name has NONZERO value $raw !")
+        fi
+    done
+
+    if [[ $checked_attributes_count -eq 0 ]]; then
+        warn "Found no attributes: $file"
+        ((attribute_error_count++))
+    fi
+
+    failing=$(echo "$smart" | grep -i failing)
+    if [[ ! -z "$failing" ]]; then
+        for line in "$failing"; do errors+=("$line"); done
+    fi
+
+    if [ ${#errors[@]} != 0 ]; then
+        warn "${#errors[@]} error(s) on $file:"
+        for i in "${!errors[@]}"; do
+            ((attribute_error_count++))
+            warn "- ${errors[$i]}"
+        done
+        warn ""
+    fi
+
+    debug "Attribute errors on $file: ${#errors[@]}"
+
+    debug "---"
+done
+
+exit $((fatal_error_count*10 + attribute_error_count))
